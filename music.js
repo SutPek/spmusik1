@@ -2,12 +2,15 @@
  * Self-contained: menyuntikkan UI sendiri, tidak perlu mengubah app.js.
  * Fitur: putar link YouTube (video / playlist), simpan ke daftar putar,
  * hapus per lagu, hapus semua, next/prev, volume, repeat. Tersimpan di localStorage.
+ * Perbaikan: musik lanjut otomatis (lagu + posisi detik) setelah HUD
+ * dimuat ulang / disembunyikan, mis. saat keluar dari mobil.
  */
 (function () {
   'use strict';
 
   var STORE_KEY = 'samc_music_playlist_v1';
   var VOL_KEY = 'samc_music_volume_v1';
+  var RESUME_KEY = 'samc_music_resume_v1';
 
   var state = {
     items: [],      // { type:'video'|'playlist', id, title }
@@ -16,7 +19,9 @@
     ready: false,
     player: null,
     apiRequested: false,
-    pendingPlay: null
+    pendingPlay: null,
+    wantPlay: false,  // user memang ingin musik jalan (beda dengan jeda oleh sistem)
+    resumeTries: 0
   };
 
   /* ---------- storage ---------- */
@@ -32,6 +37,32 @@
   }
   function getVolume() {
     try { var v = parseInt(localStorage.getItem(VOL_KEY), 10); return isNaN(v) ? 70 : v; } catch (e) { return 70; }
+  }
+
+  /* ---------- simpan / pulihkan posisi lagu ---------- */
+  function saveResume() {
+    if (!state.ready || state.current < 0) return;
+    try {
+      var cur = state.items[state.current];
+      if (!cur) return;
+      var p = state.player;
+      var st = p.getPlayerState();
+      // hanya simpan saat benar-benar sedang main/jeda, supaya tidak menimpa dengan waktu 0
+      if (st !== YT.PlayerState.PLAYING && st !== YT.PlayerState.PAUSED) return;
+      localStorage.setItem(RESUME_KEY, JSON.stringify({
+        current: state.current,
+        id: cur.id,
+        time: p.getCurrentTime() || 0,
+        plIndex: (cur.type === 'playlist' && p.getPlaylistIndex) ? (p.getPlaylistIndex() || 0) : 0,
+        playing: state.wantPlay
+      }));
+    } catch (e) {}
+  }
+  function loadResume() {
+    try { return JSON.parse(localStorage.getItem(RESUME_KEY)); } catch (e) { return null; }
+  }
+  function clearResume() {
+    try { localStorage.removeItem(RESUME_KEY); } catch (e) {}
   }
 
   /* ---------- parse link YouTube ---------- */
@@ -194,7 +225,7 @@
     if (wasCurrent) {
       stopPlayer();
       if (state.items.length) playIndex(Math.min(i, state.items.length - 1));
-      else { state.current = -1; state.playing = false; render(); }
+      else { state.current = -1; state.playing = false; clearResume(); render(); }
       return;
     }
     if (i < state.current) state.current--;
@@ -207,6 +238,7 @@
     state.items = [];
     state.current = -1;
     save();
+    clearResume();
     stopPlayer();
     state.playing = false;
     render();
@@ -252,6 +284,7 @@
   function onPlayerState(e) {
     if (e.data === YT.PlayerState.PLAYING) {
       state.playing = true;
+      state.resumeTries = 0;
       var cur = state.items[state.current];
       try {
         var d = state.player.getVideoData();
@@ -262,19 +295,36 @@
     } else if (e.data === YT.PlayerState.PAUSED) {
       state.playing = false;
       el.play.innerHTML = '&#9654;';
+      // kalau bukan user yang menjeda (mis. HUD disembunyikan), lanjutkan otomatis
+      if (state.wantPlay && state.resumeTries < 3) {
+        state.resumeTries++;
+        setTimeout(function () {
+          if (state.wantPlay) { try { state.player.playVideo(); } catch (err) {} }
+        }, 400);
+      }
     } else if (e.data === YT.PlayerState.ENDED) {
       step(1, true);
     }
   }
 
-  function playIndex(i) {
+  // resume (opsional): { time, plIndex } untuk lanjut dari posisi tersimpan
+  function playIndex(i, resume) {
     if (i < 0 || i >= state.items.length) return;
     state.current = i;
+    state.wantPlay = true;
     var it = state.items[i];
     render();
     ensureApi(function () {
-      if (it.type === 'playlist') state.player.loadPlaylist({ listType: 'playlist', list: it.id, index: 0 });
-      else state.player.loadVideoById(it.id);
+      var t = resume ? (resume.time || 0) : 0;
+      if (it.type === 'playlist') {
+        state.player.loadPlaylist({
+          listType: 'playlist', list: it.id,
+          index: resume ? (resume.plIndex || 0) : 0,
+          startSeconds: t
+        });
+      } else {
+        state.player.loadVideoById({ videoId: it.id, startSeconds: t });
+      }
       state.player.setVolume(parseInt(el.vol.value, 10));
     });
   }
@@ -284,7 +334,9 @@
     var n = state.current + dir;
     if (n >= state.items.length || n < 0) {
       var loop = el.repeat.classList.contains('ytm-on');
-      if (fromEnd && !loop && n >= state.items.length) { state.playing = false; render(); return; }
+      if (fromEnd && !loop && n >= state.items.length) {
+        state.playing = false; state.wantPlay = false; render(); return;
+      }
       n = (n + state.items.length) % state.items.length;
     }
     playIndex(n);
@@ -295,14 +347,28 @@
     if (state.current === -1) { playIndex(0); return; }
     if (!state.ready) { playIndex(state.current); return; }
     var st = state.player.getPlayerState();
-    if (st === YT.PlayerState.PLAYING) state.player.pauseVideo();
-    else if (st === YT.PlayerState.PAUSED) state.player.playVideo();
+    if (st === YT.PlayerState.PLAYING) { state.wantPlay = false; state.player.pauseVideo(); }
+    else if (st === YT.PlayerState.PAUSED) { state.wantPlay = true; state.player.playVideo(); }
     else playIndex(state.current);
   }
 
   function stopPlayer() {
+    state.wantPlay = false;
     if (state.ready) { try { state.player.stopVideo(); } catch (e) {} }
     state.playing = false;
+  }
+
+  /* ---------- lanjut otomatis ---------- */
+  // Cadangan kalau autoplay diblokir: ketuk layar sekali untuk melanjutkan.
+  function armGestureResume() {
+    var h = function (e) {
+      if (e.target && e.target.closest && e.target.closest('#ytm-root')) return;
+      document.removeEventListener('pointerdown', h, true);
+      if (state.wantPlay && state.ready && !state.playing) {
+        try { state.player.playVideo(); } catch (err) {}
+      }
+    };
+    document.addEventListener('pointerdown', h, true);
   }
 
   /* ---------- init ---------- */
@@ -310,6 +376,24 @@
     load();
     build();
     render();
+
+    // simpan posisi lagu secara berkala dan saat halaman disembunyikan/ditutup
+    setInterval(saveResume, 2000);
+    window.addEventListener('pagehide', saveResume);
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) { saveResume(); return; }
+      if (state.wantPlay && state.ready && !state.playing) {
+        try { state.player.playVideo(); } catch (e) {}
+      }
+    });
+
+    // pulihkan lagu terakhir dan lanjut otomatis
+    var r = loadResume();
+    if (r && state.items[r.current] && state.items[r.current].id === r.id) {
+      state.current = r.current;
+      render();
+      if (r.playing) { armGestureResume(); playIndex(r.current, r); }
+    }
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
