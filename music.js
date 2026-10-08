@@ -22,7 +22,7 @@
     pendingPlay: null,
     wantPlay: false,  // user memang ingin musik jalan (beda dengan jeda oleh sistem)
     resumeTries: 0,
-    adMode: false,        // sedang terdeteksi iklan
+    adMode: true,        // sedang terdeteksi iklan
     adOpenedPanel: false  // panel dibuka otomatis oleh deteksi iklan
   };
 
