@@ -1,42 +1,43 @@
-/* SAMC Speedo - Music Player (Invidious + HTML5 Audio)
- * Self-contained: menyuntikkan UI sendiri, tidak perlu mengubah app.js.
- * Tanpa YouTube IFrame API, tanpa YT.Player, tanpa deteksi iklan.
- * Alur: link YouTube -> ID -> Invidious API -> stream audio -> <audio>.
- * Fitur: video / playlist, daftar putar, hapus, next/prev, volume, repeat,
- *        failover antar instance Invidious, resume posisi terakhir.
+/* SAMC Speedo - Music Player (versi Piped)
+ * Tidak memakai YouTube iframe. Audio diambil lewat API Piped lalu
+ * diputar dengan elemen <audio> biasa, jadi tidak kena error embed.
+ * Fitur: link video / playlist, daftar putar, hapus per lagu, hapus semua,
+ * next/prev, seek, volume, repeat. Tersimpan di localStorage.
+ * Format data localStorage sama dengan versi lama (daftar lama tetap terbaca).
  */
 (function () {
   'use strict';
 
   var STORE_KEY = 'samc_music_playlist_v1';
   var VOL_KEY = 'samc_music_volume_v1';
-  var RESUME_KEY = 'samc_music_resume_v1';
 
-  /* ---------- Invidious ---------- */
-  // Daftar instance publik bisa berubah / mati. Cek https://instances.invidious.io
-  // Idealnya ganti dengan instance self-hosted milik sendiri (taruh paling atas).
-  var INVIDIOUS_INSTANCES = [
-    'https://inv.nadeko.net',
-    'https://invidious.nerdvpn.de',
-    'https://yt.chocolatemoo53.com',
-    'https://invidious.tiekoetter.com',
-    'https://invidious.f5.si'
+  // Instance Piped sering berubah/mati. Daftar ini dicoba berurutan,
+  // dan akan ditambah otomatis dari daftar resmi (lihat refreshInstances).
+  var INSTANCES = [
+    'https://pipedapi.kavin.rocks',
+    'https://api.piped.private.coffee',
+    'https://pipedapi.adminforge.de',
+    'https://pipedapi.leptons.xyz',
+    'https://pipedapi.nosebs.ru'
   ];
-  var REQUEST_TIMEOUT = 8000; // ms per instance
+  var INSTANCE_LIST_URL = 'https://piped-instances.kavin.rocks/';
+  var TIMEOUT_MS = 10000;
 
   var state = {
-    items: [],          // { type:'video'|'playlist', id, title }
-    current: -1,
+    items: [],      // { type:'video'|'playlist', id, title }
+    current: -1,    // index di items
+    queue: [],      // daftar video id yang sedang diputar (1 untuk video, banyak untuk playlist)
+    qi: 0,          // posisi di queue
+    urls: [],       // kandidat URL audio untuk lagu saat ini
+    ui: 0,          // index URL yang sedang dicoba
     playing: false,
-    player: null,       // elemen <audio>
-    instanceIndex: 0,   // instance terakhir yang berhasil
-    loading: false,
-    wantPlay: false,
-    token: 0,           // pembatal request lama saat ganti lagu
-    retry: 0,
-    failStreak: 0,
-    resume: null        // { id, time }
+    loaded: false,  // audio.src sudah terisi
+    token: 0,       // untuk membatalkan permintaan lama
+    instIdx: 0
   };
+
+  var audio = new Audio();
+  audio.preload = 'auto';
 
   /* ---------- storage ---------- */
   function load() {
@@ -45,31 +46,12 @@
       var arr = raw ? JSON.parse(raw) : [];
       if (Array.isArray(arr)) state.items = arr.filter(function (x) { return x && x.id && x.type; });
     } catch (e) { state.items = []; }
-    try {
-      var r = JSON.parse(localStorage.getItem(RESUME_KEY) || 'null');
-      if (r && typeof r.current === 'number' && state.items[r.current] && state.items[r.current].id === r.id) {
-        state.current = r.current;
-        state.resume = { id: r.id, time: r.time || 0 };
-      }
-    } catch (e) {}
   }
   function save() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(state.items)); } catch (e) {}
   }
   function getVolume() {
     try { var v = parseInt(localStorage.getItem(VOL_KEY), 10); return isNaN(v) ? 70 : v; } catch (e) { return 70; }
-  }
-  function saveResume() {
-    if (!state.player || state.current < 0) return;
-    var cur = state.items[state.current];
-    if (!cur || !state.player.src) return;
-    try {
-      localStorage.setItem(RESUME_KEY, JSON.stringify({
-        current: state.current,
-        id: cur.id,
-        time: state.player.currentTime || 0
-      }));
-    } catch (e) {}
   }
 
   /* ---------- parse link YouTube ---------- */
@@ -94,83 +76,101 @@
     return null;
   }
 
-  /* ---------- API Invidious (dengan failover) ---------- */
-  function invidiousFetch(path) {
-    var n = INVIDIOUS_INSTANCES.length;
-    var tried = 0;
+  /* ---------- Piped API ---------- */
+  function fetchTimeout(url) {
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var t = setTimeout(function () {
+        if (done) return;
+        done = true;
+        if (ctrl) ctrl.abort();
+        reject(new Error('timeout'));
+      }, TIMEOUT_MS);
+      fetch(url, ctrl ? { signal: ctrl.signal } : undefined).then(function (r) {
+        if (done) return;
+        done = true; clearTimeout(t);
+        if (!r.ok) { reject(new Error('http ' + r.status)); return; }
+        return r.json().then(resolve, reject);
+      }, function (e) {
+        if (done) return;
+        done = true; clearTimeout(t);
+        reject(e);
+      });
+    });
+  }
 
-    function next() {
-      if (tried >= n) return Promise.reject(new Error('Semua instance Invidious gagal.'));
-      var idx = (state.instanceIndex + tried) % n;
-      tried++;
-      var base = INVIDIOUS_INSTANCES[idx];
-      var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-      var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, REQUEST_TIMEOUT);
-
-      return fetch(base + path, {
-        method: 'GET',
-        headers: { 'Accept': 'application/json' },
-        signal: ctrl ? ctrl.signal : undefined
-      })
-        .then(function (r) {
-          clearTimeout(timer);
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          return r.json();
-        })
-        .then(function (data) {
-          if (!data || data.error) throw new Error((data && data.error) || 'Respons kosong');
-          state.instanceIndex = idx;
-          return { data: data, base: base };
-        })
-        .catch(function () {
-          clearTimeout(timer);
-          return next();
-        });
+  // Coba tiap instance berurutan sampai ada yang berhasil.
+  function api(path) {
+    var n = INSTANCES.length;
+    var start = state.instIdx;
+    function attempt(k) {
+      if (k >= n) return Promise.reject(new Error('semua instance gagal'));
+      var idx = (start + k) % n;
+      return fetchTimeout(INSTANCES[idx] + path).then(function (j) {
+        if (j && j.error) throw new Error(j.error);
+        state.instIdx = idx;
+        return j;
+      }).catch(function () { return attempt(k + 1); });
     }
-    return next();
+    return attempt(0);
   }
 
-  function fetchVideo(id) {
-    return invidiousFetch('/api/v1/videos/' + encodeURIComponent(id) + '?hl=id&local=true');
+  // Ambil daftar instance terbaru dari situs resmi Piped (jika bisa).
+  function refreshInstances() {
+    fetchTimeout(INSTANCE_LIST_URL).then(function (list) {
+      if (!Array.isArray(list)) return;
+      list.sort(function (a, b) { return (b.uptime_30d || 0) - (a.uptime_30d || 0); });
+      var fresh = [];
+      list.forEach(function (x) {
+        if (x && x.api_url && /^https:\/\//.test(x.api_url)) {
+          var u = x.api_url.replace(/\/+$/, '');
+          if (fresh.indexOf(u) === -1 && INSTANCES.indexOf(u) === -1) fresh.push(u);
+        }
+      });
+      INSTANCES = INSTANCES.concat(fresh.slice(0, 6));
+    }).catch(function () {});
   }
-  function fetchPlaylist(id) {
-    return invidiousFetch('/api/v1/playlists/' + encodeURIComponent(id) + '?hl=id');
+
+  function pickAudioUrls(info) {
+    var streams = (info && info.audioStreams) || [];
+    streams = streams.filter(function (s) { return s && s.url; });
+    function score(s) {
+      var mt = (s.mimeType || '').toLowerCase();
+      var codec = (mt.indexOf('mp4') !== -1 || mt.indexOf('m4a') !== -1) ? 1 : 0; // AAC paling kompatibel
+      return codec * 1000000 + (s.bitrate || 0);
+    }
+    streams.sort(function (a, b) { return score(b) - score(a); });
+    return streams.map(function (s) { return s.url; });
   }
 
   function fetchTitle(entry) {
-    var req = entry.type === 'video' ? fetchVideo(entry.id) : fetchPlaylist(entry.id);
-    return req
-      .then(function (res) { return res.data.title || null; })
-      .catch(function () { return null; });
+    var p = entry.type === 'video'
+      ? api('/streams/' + entry.id).then(function (j) { return j.title; })
+      : api('/playlists/' + entry.id).then(function (j) { return j.name; });
+    return p.then(function (t) { return t || null; }).catch(function () { return null; });
   }
 
-  /* ---------- pilih stream audio ---------- */
-  function pickStream(data, base) {
-    var audioEl = state.player;
-    var adaptive = Array.isArray(data.adaptiveFormats) ? data.adaptiveFormats : [];
-    var muxed = Array.isArray(data.formatStreams) ? data.formatStreams : [];
-
-    function playable(s) {
-      if (!s || !s.url) return false;
-      try { return audioEl.canPlayType(String(s.type || '')) !== ''; } catch (e) { return true; }
+  function fetchPlaylistIds(id) {
+    var ids = [];
+    function collect(j) {
+      (j.relatedStreams || []).forEach(function (s) {
+        var m = s && s.url && s.url.match(/[?&]v=([\w-]{11})/);
+        if (m) ids.push(m[1]);
+      });
     }
-    function byBitrate(a, b) { return parseInt(b.bitrate || 0, 10) - parseInt(a.bitrate || 0, 10); }
-
-    var audioOnly = adaptive.filter(function (s) {
-      return String(s.type || '').toLowerCase().indexOf('audio/') === 0 && playable(s);
+    return api('/playlists/' + id).then(function (j) {
+      collect(j);
+      var title = j.name || null;
+      var next = j.nextpage;
+      function more(page) {
+        if (!next || page >= 3) return ids;
+        return api('/nextpage/playlists/' + id + '?nextpage=' + encodeURIComponent(next))
+          .then(function (jj) { collect(jj); next = jj.nextpage; return more(page + 1); })
+          .catch(function () { return ids; });
+      }
+      return Promise.resolve(more(0)).then(function () { return { ids: ids, title: title }; });
     });
-    // utamakan mp4/aac (kompatibel luas), lalu sisanya (webm/opus)
-    var mp4 = audioOnly.filter(function (s) { return /audio\/mp4/i.test(s.type); }).sort(byBitrate);
-    var rest = audioOnly.filter(function (s) { return !/audio\/mp4/i.test(s.type); }).sort(byBitrate);
-
-    var chosen = mp4[0] || rest[0];
-    // cadangan: stream gabungan video+audio (kualitas rendah), tetap bisa diputar di <audio>
-    if (!chosen) chosen = muxed.filter(playable).sort(byBitrate)[0] || muxed[0];
-    if (!chosen || !chosen.url) throw new Error('Stream audio tidak ditemukan.');
-
-    var url = chosen.url;
-    if (url.charAt(0) === '/') url = base + url; // URL proxy relatif
-    return url;
   }
 
   /* ---------- UI ---------- */
@@ -187,12 +187,14 @@
       '<section id="ytm-panel" class="ytm-hide" aria-label="Pemutar musik">' +
         '<div class="ytm-head"><span class="ytm-now" id="ytm-now">Belum ada lagu</span>' +
         '<button id="ytm-close" type="button" class="ytm-icon" title="Tutup">&times;</button></div>' +
-        '<div class="ytm-video" id="ytm-video" style="display:none"></div>' +
         '<div class="ytm-controls">' +
           '<button id="ytm-prev" type="button" class="ytm-icon" title="Sebelumnya">&#9198;</button>' +
           '<button id="ytm-play" type="button" class="ytm-icon ytm-main" title="Putar / Jeda">&#9654;</button>' +
           '<button id="ytm-next" type="button" class="ytm-icon" title="Berikutnya">&#9197;</button>' +
           '<button id="ytm-repeat" type="button" class="ytm-icon ytm-on" title="Ulangi daftar putar">&#8635;</button>' +
+          '<input id="ytm-seek" type="range" min="0" max="1000" value="0" aria-label="Posisi lagu">' +
+        '</div>' +
+        '<div class="ytm-controls">' +
           '<input id="ytm-vol" type="range" min="0" max="100" aria-label="Volume">' +
         '</div>' +
         '<div class="ytm-add">' +
@@ -206,7 +208,7 @@
       '</section>';
     document.body.appendChild(wrap);
 
-    ['toggle','panel','close','now','prev','play','next','repeat','vol','input','add','msg','count','clear','list','video']
+    ['toggle','panel','close','now','prev','play','next','repeat','seek','vol','input','add','msg','count','clear','list']
       .forEach(function (k) { el[k] = document.getElementById('ytm-' + k); });
 
     // cegah HUD ikut tergeser saat berinteraksi dengan panel musik
@@ -225,10 +227,24 @@
     el.clear.addEventListener('click', clearAll);
 
     el.vol.value = getVolume();
+    audio.volume = getVolume() / 100;
     el.vol.addEventListener('input', function () {
       var v = parseInt(el.vol.value, 10);
       try { localStorage.setItem(VOL_KEY, String(v)); } catch (e) {}
-      if (state.player) state.player.volume = v / 100;
+      audio.volume = v / 100;
+    });
+
+    var seeking = false;
+    el.seek.addEventListener('input', function () { seeking = true; });
+    el.seek.addEventListener('change', function () {
+      if (audio.duration && isFinite(audio.duration)) {
+        audio.currentTime = (parseInt(el.seek.value, 10) / 1000) * audio.duration;
+      }
+      seeking = false;
+    });
+    audio.addEventListener('timeupdate', function () {
+      if (seeking || !audio.duration || !isFinite(audio.duration)) return;
+      el.seek.value = Math.round((audio.currentTime / audio.duration) * 1000);
     });
   }
 
@@ -240,6 +256,8 @@
       msg._t = setTimeout(function () { el.msg.textContent = ''; }, 3500);
     }
   }
+
+  function setNow(text) { el.now.textContent = text; }
 
   function render() {
     el.count.textContent = 'Daftar putar (' + state.items.length + ')';
@@ -253,12 +271,14 @@
     state.items.forEach(function (it, i) {
       var li = document.createElement('li');
       if (i === state.current) li.className = 'ytm-active';
+
       var btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'ytm-track';
       btn.title = 'Putar';
       btn.textContent = (it.type === 'playlist' ? '[Playlist] ' : '') + (it.title || it.id);
       btn.addEventListener('click', function () { playIndex(i); });
+
       var del = document.createElement('button');
       del.type = 'button';
       del.className = 'ytm-icon ytm-del';
@@ -266,12 +286,13 @@
       del.setAttribute('aria-label', 'Hapus ' + (it.title || it.id));
       del.innerHTML = '&times;';
       del.addEventListener('click', function () { removeIndex(i); });
+
       li.appendChild(btn);
       li.appendChild(del);
       el.list.appendChild(li);
     });
     var cur = state.items[state.current];
-    el.now.textContent = cur ? (cur.title || cur.id) : 'Belum ada lagu';
+    setNow(cur ? (cur.title || cur.id) : 'Belum ada lagu');
     el.play.innerHTML = state.playing ? '&#10074;&#10074;' : '&#9654;';
   }
 
@@ -281,12 +302,14 @@
     if (!parsed) { msg('Link YouTube tidak valid.', true); return; }
     var exists = state.items.some(function (x) { return x.type === parsed.type && x.id === parsed.id; });
     if (exists) { msg('Sudah ada di daftar putar.', true); return; }
+
     var entry = { type: parsed.type, id: parsed.id, title: '' };
     state.items.push(entry);
     save();
     el.input.value = '';
     msg('Disimpan ke daftar putar.');
     render();
+
     fetchTitle(entry).then(function (t) {
       if (t) { entry.title = t; save(); render(); }
     });
@@ -314,161 +337,136 @@
     state.current = -1;
     save();
     stopPlayer();
-    try { localStorage.removeItem(RESUME_KEY); } catch (e) {}
     render();
   }
 
-  /* ---------- pemutar (HTML5 Audio) ---------- */
-  function createPlayer() {
-    if (state.player) return;
+  /* ---------- pemutar ---------- */
+  function stopPlayer() {
+    state.token++;
+    try { audio.pause(); audio.removeAttribute('src'); audio.load(); } catch (e) {}
+    state.playing = false;
+    state.loaded = false;
+    state.queue = [];
+    state.qi = 0;
+    state.urls = [];
+    if (el.seek) el.seek.value = 0;
+  }
 
-    var audio = document.createElement('audio');
-    audio.id = 'ytm-audio';
-    audio.preload = 'auto';
-    audio.controls = false;
-    audio.setAttribute('playsinline', '');
-    audio.volume = parseInt(el.vol.value, 10) / 100;
+  function playIndex(i) {
+    if (i < 0 || i >= state.items.length) return;
+    stopPlayer();
+    state.current = i;
+    var it = state.items[i];
+    var token = state.token;
+    render();
+    setNow('Memuat...');
 
-    audio.addEventListener('playing', function () {
-      state.playing = true;
-      state.retry = 0;
-      state.failStreak = 0;
-      render();
-    });
-    audio.addEventListener('pause', function () {
-      if (audio.ended) return;
-      state.playing = false;
-      el.play.innerHTML = '&#9654;';
-      saveResume();
-    });
-    audio.addEventListener('ended', function () {
-      state.playing = false;
-      step(1, true);
-    });
-    audio.addEventListener('error', function () {
-      if (!audio.getAttribute('src') || state.loading) return;
-      var it = state.items[state.current];
-      if (!it) return;
-      // coba sekali lagi lewat instance berikutnya, lalu lewati
-      if (state.retry < 1) {
-        state.retry++;
-        state.instanceIndex = (state.instanceIndex + 1) % INVIDIOUS_INSTANCES.length;
-        msg('Stream gagal, mencoba instance lain...', true);
-        loadTrack(it, audio.currentTime || 0, state.token);
-      } else {
-        skipBroken(state.token);
-      }
-    });
+    if (it.type === 'playlist') {
+      fetchPlaylistIds(it.id).then(function (res) {
+        if (token !== state.token) return;
+        if (!res.ids.length) throw new Error('playlist kosong');
+        if (res.title && !it.title) { it.title = res.title; save(); }
+        state.queue = res.ids;
+        state.qi = 0;
+        render();
+        playQueueCurrent(token);
+      }).catch(function () {
+        if (token !== state.token) return;
+        msg('Playlist gagal dimuat, lanjut ke berikutnya.', true);
+        setTimeout(function () { if (token === state.token) step(1, true); }, 1200);
+      });
+    } else {
+      state.queue = [it.id];
+      state.qi = 0;
+      playQueueCurrent(token);
+    }
+  }
 
-    el.video.appendChild(audio);
-    state.player = audio;
+  function playQueueCurrent(token) {
+    var vid = state.queue[state.qi];
+    if (!vid) return;
+    var it = state.items[state.current];
+    setNow('Memuat...');
+    api('/streams/' + vid).then(function (info) {
+      if (token !== state.token) return;
+      var urls = pickAudioUrls(info);
+      if (!urls.length) throw new Error('tidak ada stream audio');
+      if (it && it.type === 'video' && !it.title && info.title) { it.title = info.title; save(); }
+      state.urls = urls;
+      state.ui = 0;
+      var label = (it && it.type === 'playlist')
+        ? ((info.title || vid) + (state.queue.length > 1 ? ' (' + (state.qi + 1) + '/' + state.queue.length + ')' : ''))
+        : ((it && it.title) || info.title || vid);
+      setNow(label);
+      startAudio(token);
+    }).catch(function () {
+      if (token !== state.token) return;
+      skipBroken(token);
+    });
+  }
+
+  function startAudio(token) {
+    audio.src = state.urls[state.ui];
+    state.loaded = true;
+    var p = audio.play();
+    if (p && p.catch) {
+      p.catch(function (err) {
+        if (token !== state.token) return;
+        if (err && err.name === 'NotAllowedError') {
+          state.playing = false;
+          render();
+          msg('Tekan Play untuk memulai.', true);
+        }
+        // error lain ditangani oleh event 'error' pada audio
+      });
+    }
   }
 
   function skipBroken(token) {
-    state.playing = false;
-    state.failStreak++;
-    if (state.failStreak >= state.items.length) {
-      msg('Semua lagu gagal diputar. Coba lagi nanti.', true);
-      state.failStreak = 0;
-      render();
-      return;
-    }
     msg('Lagu tidak bisa diputar, lanjut ke berikutnya.', true);
-    setTimeout(function () { if (token === state.token) step(1, true); }, 1200);
+    setTimeout(function () {
+      if (token !== state.token) return;
+      advance(true);
+    }, 1200);
   }
 
-  function loadTrack(it, startTime, token) {
-    state.loading = true;
-    msg('Memuat...');
-
-    fetchVideo(it.id)
-      .then(function (res) {
-        if (token !== state.token) return null;
-        var d = res.data;
-        if (d.title && !it.title) { it.title = d.title; save(); }
-        var url = pickStream(d, res.base);
-        var a = state.player;
-
-        a.src = url;
-        if (startTime > 1) {
-          a.addEventListener('loadedmetadata', function h() {
-            a.removeEventListener('loadedmetadata', h);
-            try { a.currentTime = startTime; } catch (e) {}
-          });
-        }
-        state.loading = false;
-        render();
-        return a.play();
-      })
-      .then(function () {
-        if (token === state.token) { state.loading = false; msg(''); }
-      })
-      .catch(function (err) {
-        if (token !== state.token) return;
-        state.loading = false;
-        if (err && err.name === 'NotAllowedError') {
-          msg('Browser memblokir autoplay. Tekan Play.', true);
-          state.playing = false;
-          render();
-          return;
-        }
-        console.error('[Musik]', err);
-        skipBroken(token);
-      });
+  // Maju ke lagu berikutnya di queue; jika habis, ke item daftar putar berikutnya.
+  function advance(fromEnd) {
+    if (state.qi + 1 < state.queue.length) {
+      state.qi++;
+      playQueueCurrent(state.token);
+    } else {
+      step(1, fromEnd);
+    }
   }
 
-  function expandPlaylist(i, token) {
-    var entry = state.items[i];
-    state.loading = true;
-    msg('Memuat playlist...');
-
-    fetchPlaylist(entry.id)
-      .then(function (res) {
-        if (token !== state.token) return;
-        var videos = res.data && res.data.videos;
-        if (!Array.isArray(videos) || !videos.length) throw new Error('Playlist kosong / tidak valid.');
-
-        var newItems = videos
-          .filter(function (v) { return v && v.videoId; })
-          .map(function (v) { return { type: 'video', id: v.videoId, title: v.title || '' }; });
-        if (!newItems.length) throw new Error('Playlist tidak berisi video.');
-
-        // ganti entry playlist dengan daftar videonya
-        Array.prototype.splice.apply(state.items, [i, 1].concat(newItems));
-        save();
-        state.current = i;
-        state.loading = false;
-        render();
-        loadTrack(state.items[i], 0, token);
-      })
-      .catch(function (err) {
-        if (token !== state.token) return;
-        console.error('[Musik Playlist]', err);
-        state.loading = false;
-        msg('Playlist gagal dimuat.', true);
-        render();
-      });
-  }
-
-  function playIndex(i, startTime) {
-    if (i < 0 || i >= state.items.length) return;
-    state.current = i;
-    state.wantPlay = true;
-    var it = state.items[i];
-    render();
-    createPlayer();
-    var token = ++state.token;
-    state.retry = 0;
-    if (it.type === 'playlist') { expandPlaylist(i, token); return; }
-    loadTrack(it, startTime || 0, token);
-  }
+  audio.addEventListener('playing', function () {
+    state.playing = true;
+    el.play.innerHTML = '&#10074;&#10074;';
+  });
+  audio.addEventListener('pause', function () {
+    if (audio.ended) return;
+    state.playing = false;
+    el.play.innerHTML = '&#9654;';
+  });
+  audio.addEventListener('ended', function () { advance(true); });
+  audio.addEventListener('error', function () {
+    if (!state.loaded) return;
+    var token = state.token;
+    if (state.ui + 1 < state.urls.length) {
+      state.ui++;
+      startAudio(token);
+    } else {
+      skipBroken(token);
+    }
+  });
 
   function step(dir, fromEnd) {
     if (!state.items.length) return;
     var n = state.current + dir;
     if (n >= state.items.length || n < 0) {
       var loop = el.repeat.classList.contains('ytm-on');
-      if (fromEnd && !loop && n >= state.items.length) { state.playing = false; render(); return; }
+      if (fromEnd && !loop && n >= state.items.length) { stopPlayer(); render(); return; }
       n = (n + state.items.length) % state.items.length;
     }
     playIndex(n);
@@ -477,35 +475,12 @@
   function togglePlay() {
     if (!state.items.length) { msg('Tambahkan link YouTube dulu.', true); return; }
     if (state.current === -1) { playIndex(0); return; }
-
-    var a = state.player;
-    if (!a || !a.getAttribute('src')) {
-      var cur = state.items[state.current];
-      var t = state.resume && cur && state.resume.id === cur.id ? state.resume.time : 0;
-      state.resume = null;
-      playIndex(state.current, t);
-      return;
-    }
-    if (!a.paused) {
-      state.wantPlay = false;
-      a.pause();
+    if (!state.loaded) { playIndex(state.current); return; }
+    if (audio.paused) {
+      var p = audio.play();
+      if (p && p.catch) p.catch(function () { playIndex(state.current); });
     } else {
-      state.wantPlay = true;
-      a.play().catch(function () { msg('Gagal memutar. Tekan Play sekali lagi.', true); });
-    }
-  }
-
-  function stopPlayer() {
-    state.token++;
-    state.wantPlay = false;
-    state.playing = false;
-    state.loading = false;
-    if (state.player) {
-      try {
-        state.player.pause();
-        state.player.removeAttribute('src');
-        state.player.load();
-      } catch (e) {}
+      audio.pause();
     }
   }
 
@@ -514,8 +489,7 @@
     load();
     build();
     render();
-    setInterval(function () { if (state.playing) saveResume(); }, 5000);
-    window.addEventListener('pagehide', saveResume);
+    refreshInstances();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
