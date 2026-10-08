@@ -1,0 +1,107 @@
+/* SAMC Speedo - YouTube Music Player */
+#ytm-root {
+  --ytm-bg: rgba(14, 18, 22, 0.92);
+  --ytm-line: rgba(255, 255, 255, 0.12);
+  --ytm-text: #e8edf0;
+  --ytm-dim: #8f9aa3;
+  --ytm-accent: #2ecc71;
+  --ytm-danger: #ff5c5c;
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 9999;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  color: var(--ytm-text);
+}
+#ytm-root .ytm-hide { display: none !important; }
+#ytm-root button { font: inherit; color: inherit; cursor: pointer; }
+#ytm-root button:focus-visible,
+#ytm-root input:focus-visible { outline: 2px solid var(--ytm-accent); outline-offset: 1px; }
+
+#ytm-toggle {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--ytm-line);
+  background: var(--ytm-bg);
+  display: grid; place-items: center;
+  color: var(--ytm-accent);
+}
+#ytm-toggle:hover { background: #1a2128; }
+
+#ytm-panel {
+  position: absolute;
+  left: 0; bottom: 42px;
+  width: 280px;
+  max-width: calc(100vw - 24px);
+  padding: 10px;
+  border: 1px solid var(--ytm-line);
+  border-radius: 10px;
+  background: var(--ytm-bg);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+.ytm-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.ytm-now { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.ytm-video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; overflow: hidden; margin-bottom: 8px; }
+.ytm-video iframe { width: 100%; height: 100%; display: block; pointer-events: none; }
+
+.ytm-controls { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; }
+.ytm-icon {
+  min-width: 28px; height: 28px;
+  border: 0; border-radius: 6px;
+  background: transparent;
+  font-size: 15px; line-height: 1;
+}
+.ytm-icon:hover { background: rgba(255, 255, 255, 0.1); }
+.ytm-main { background: var(--ytm-accent); color: #0b1410 !important; font-size: 13px; }
+.ytm-main:hover { background: #3fe086; }
+#ytm-repeat { color: var(--ytm-dim); }
+#ytm-repeat.ytm-on { color: var(--ytm-accent); }
+#ytm-vol { flex: 1; min-width: 0; accent-color: var(--ytm-accent); margin-left: 4px; }
+
+.ytm-add { display: flex; gap: 6px; }
+#ytm-input {
+  flex: 1; min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--ytm-line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--ytm-text);
+}
+#ytm-input::placeholder { color: var(--ytm-dim); }
+#ytm-add {
+  padding: 0 12px;
+  border: 0; border-radius: 6px;
+  background: var(--ytm-accent);
+  color: #0b1410; font-weight: 600;
+}
+#ytm-add:hover { background: #3fe086; }
+
+.ytm-msg { min-height: 16px; margin-top: 4px; color: var(--ytm-accent); }
+.ytm-msg.ytm-err { color: var(--ytm-danger); }
+
+.ytm-list-head { display: flex; justify-content: space-between; align-items: center; margin: 4px 0 4px; color: var(--ytm-dim); }
+.ytm-link { border: 0; background: none; padding: 2px 4px; color: var(--ytm-danger) !important; }
+.ytm-link:hover { text-decoration: underline; }
+
+#ytm-list { list-style: none; margin: 0; padding: 0; max-height: 150px; overflow-y: auto; }
+#ytm-list li { display: flex; align-items: center; border-radius: 6px; }
+#ytm-list li:hover { background: rgba(255, 255, 255, 0.06); }
+#ytm-list li.ytm-active { background: rgba(46, 204, 113, 0.14); }
+#ytm-list li.ytm-active .ytm-track { color: var(--ytm-accent); font-weight: 600; }
+.ytm-track {
+  flex: 1; min-width: 0;
+  padding: 6px 6px;
+  border: 0; background: none; text-align: left;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ytm-del { color: var(--ytm-dim); }
+.ytm-del:hover { color: var(--ytm-danger); }
+.ytm-empty { padding: 8px 4px; color: var(--ytm-dim); }
+
+@media (prefers-reduced-motion: no-preference) {
+  #ytm-panel { animation: ytm-in 0.14s ease-out; }
+  @keyframes ytm-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+}
