@@ -21,9 +21,7 @@
     apiRequested: false,
     pendingPlay: null,
     wantPlay: false,  // user memang ingin musik jalan (beda dengan jeda oleh sistem)
-    resumeTries: 0,
-    adMode: false,        // sedang terdeteksi iklan
-    adOpenedPanel: false  // panel dibuka otomatis oleh deteksi iklan
+    resumeTries: 0
   };
 
   /* ---------- storage ---------- */
@@ -112,10 +110,7 @@
       '<section id="ytm-panel" class="ytm-hide" aria-label="Pemutar musik YouTube">' +
         '<div class="ytm-head"><span class="ytm-now" id="ytm-now">Belum ada lagu</span>' +
         '<button id="ytm-close" type="button" class="ytm-icon" title="Tutup">&times;</button></div>' +
-        '<div class="ytm-video" id="ytm-video"><div id="ytm-player"></div></div>' +
-        '<div class="ytm-adbar ytm-hide" id="ytm-adbar" role="status">' +
-          'Iklan diputar. Arahkan kursor lalu klik tombol <b>Lewati / Skip</b> di pojok kanan bawah video.' +
-        '</div>' +
+        '<div class="ytm-video"><div id="ytm-player"></div></div>' +
         '<div class="ytm-controls">' +
           '<button id="ytm-prev" type="button" class="ytm-icon" title="Sebelumnya">&#9198;</button>' +
           '<button id="ytm-play" type="button" class="ytm-icon ytm-main" title="Putar / Jeda">&#9654;</button>' +
@@ -134,7 +129,7 @@
       '</section>';
     document.body.appendChild(wrap);
 
-    ['toggle','panel','close','video','adbar','now','prev','play','next','repeat','vol','input','add','msg','count','clear','list']
+    ['toggle','panel','close','now','prev','play','next','repeat','vol','input','add','msg','count','clear','list']
       .forEach(function (k) { el[k] = document.getElementById('ytm-' + k); });
 
     // cegah HUD ikut tergeser saat berinteraksi dengan panel musik
@@ -291,12 +286,10 @@
       state.playing = true;
       state.resumeTries = 0;
       var cur = state.items[state.current];
-      checkAd();
       try {
         var d = state.player.getVideoData();
-        // jangan simpan judul iklan sebagai judul lagu
-        if (!state.adMode && cur && d && d.title && cur.type === 'video' && !cur.title) { cur.title = d.title; save(); }
-        if (!state.adMode && cur && cur.type === 'playlist' && d && d.title) el.now.textContent = d.title;
+        if (cur && d && d.title && cur.type === 'video' && !cur.title) { cur.title = d.title; save(); }
+        if (cur && cur.type === 'playlist' && d && d.title) el.now.textContent = d.title;
       } catch (err) {}
       if (!(cur && cur.type === 'playlist')) render(); else el.play.innerHTML = '&#10074;&#10074;';
     } else if (e.data === YT.PlayerState.PAUSED) {
@@ -361,63 +354,8 @@
 
   function stopPlayer() {
     state.wantPlay = false;
-    setAdMode(false);
     if (state.ready) { try { state.player.stopVideo(); } catch (e) {} }
     state.playing = false;
-  }
-
-  /* ---------- iklan: skip dengan kursor ---------- */
-  // Player YouTube ada di iframe lintas-domain, jadi iklan tidak bisa dilewati lewat
-  // kode. Yang bisa dilakukan: mendeteksi iklan, membuka panel, dan mengaktifkan
-  // klik pada iframe agar kursor bisa menekan tombol "Lewati/Skip" milik YouTube.
-  function injectAdStyle() {
-    if (document.getElementById('ytm-ad-style')) return;
-    var st = document.createElement('style');
-    st.id = 'ytm-ad-style';
-    st.textContent =
-      '#ytm-root .ytm-video.ytm-ad iframe{pointer-events:auto;}' +
-      '#ytm-root .ytm-video.ytm-ad{outline:2px solid #f1c40f;}' +
-      '#ytm-root #ytm-panel.ytm-ad-mode{width:380px;}' +
-      '#ytm-root .ytm-adbar{margin:-2px 0 8px;padding:6px 8px;border-radius:6px;' +
-        'background:rgba(241,196,15,.16);color:#f1c40f;font-size:11px;line-height:1.35;}';
-    document.head.appendChild(st);
-  }
-
-  function isAdPlaying() {
-    try {
-      var cur = state.items[state.current];
-      if (!cur || !state.ready) return false;
-      var d = state.player.getVideoData();
-      var vid = d && d.video_id;
-      if (!vid) return false;
-      if (cur.type === 'video') return vid !== cur.id;
-      var list = state.player.getPlaylist && state.player.getPlaylist();
-      if (list && list.length) return list.indexOf(vid) === -1;
-    } catch (e) {}
-    return false;
-  }
-
-  function setAdMode(on) {
-    if (on === state.adMode) return;
-    state.adMode = on;
-    if (!el.video) return;
-    el.video.classList.toggle('ytm-ad', on);
-    el.panel.classList.toggle('ytm-ad-mode', on);
-    el.adbar.classList.toggle('ytm-hide', !on);
-    if (on) {
-      if (el.panel.classList.contains('ytm-hide')) {
-        el.panel.classList.remove('ytm-hide');
-        state.adOpenedPanel = true;
-      }
-    } else if (state.adOpenedPanel) {
-      el.panel.classList.add('ytm-hide');
-      state.adOpenedPanel = false;
-    }
-  }
-
-  function checkAd() {
-    if (!state.ready || state.current < 0 || !state.wantPlay) { setAdMode(false); return; }
-    setAdMode(isAdPlaying());
   }
 
   /* ---------- lanjut otomatis ---------- */
@@ -436,10 +374,8 @@
   /* ---------- init ---------- */
   function init() {
     load();
-    injectAdStyle();
     build();
     render();
-    setInterval(checkAd, 700);
 
     // simpan posisi lagu secara berkala dan saat halaman disembunyikan/ditutup
     setInterval(saveResume, 2000);
